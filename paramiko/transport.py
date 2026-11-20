@@ -1814,6 +1814,12 @@ class Transport(threading.Thread, ClosingContextManager):
         """
         send a message, but block if we're in key negotiation.  this is used
         for user-initiated requests.
+
+        :return:
+            ``False`` if the message could not be sent because the session
+            died before it reached the socket, ``True`` otherwise.  Callers
+            which need to know whether their data was actually queued (such as
+            `Channel.send`) must treat ``False`` as a closed connection.
         """
         start = time.time()
         while True:
@@ -1822,7 +1828,7 @@ class Transport(threading.Thread, ClosingContextManager):
                 self._log(
                     DEBUG, "Dropping user packet because connection is dead."
                 )  # noqa
-                return
+                return False
             self.clear_to_send_lock.acquire()
             if self.clear_to_send.is_set():
                 break
@@ -1835,6 +1841,7 @@ class Transport(threading.Thread, ClosingContextManager):
             self._send_message(data)
         finally:
             self.clear_to_send_lock.release()
+        return True
 
     def _set_K_H(self, k, h):
         """

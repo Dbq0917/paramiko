@@ -28,7 +28,8 @@ import threading
 import time
 import unittest
 from binascii import hexlify
-from unittest.mock import Mock
+from contextlib import ExitStack
+from unittest.mock import Mock, patch
 
 from pytest import mark, raises
 
@@ -911,6 +912,121 @@ class TransportTest(unittest.TestCase):
             chan.sendall(text)
             expected = text.encode("utf-8")
             self.assertEqual(sfile.read(len(expected)), expected)
+
+    def test_send_fails_when_transport_is_dead(self):
+        """
+        A dead transport must make sends fail even if this channel has not
+        received its close notification yet (transport and channel state are
+        tracked independently).
+        """
+        self.setup_test_server()
+        chan = self.tc.open_session()
+        self.ts.accept(1.0)
+
+        self.tc.active = False
+        with self.assertRaises(socket.error):
+            chan.send(b"command")
+        with self.assertRaises(socket.error):
+            chan.sendall(b"command")
+
+    def test_send_fails_if_transport_dies_during_send(self):
+        """
+        Do not report success if the transport dies after the pre-send check
+        but before the packet reaches the socket.
+        """
+        self.setup_test_server()
+        chan = self.tc.open_session()
+        self.ts.accept(1.0)
+
+        with patch.object(self.tc, "_send_user_message", return_value=False):
+            with self.assertRaises(socket.error):
+                chan.send(b"command")
+
+    def test_failed_send_is_not_retried(self):
+        """
+        A failed send must surface to the caller exactly once.  Reconnecting
+        and retrying is the caller's job, and the library must not replay the
+        failed (or a whole batch of) command data on its own.
+        """
+        self.setup_test_server()
+        chan = self.tc.open_session()
+        self.ts.accept(1.0)
+
+        with patch.object(
+            self.tc, "_send_user_message", return_value=False
+        ) as sender:
+            with self.assertRaises(socket.error):
+                chan.sendall(b"command")
+        self.assertEqual(sender.call_count, 1)
+
+    def test_normal_send_uses_one_message(self):
+        """
+        The pre-send validation must stay local; a normal send should not add
+        a liveness probe (and therefore an extra round trip).
+        """
+        self.setup_test_server()
+        chan = self.tc.open_session()
+        schan = self.ts.accept(1.0)
+
+        with patch.object(
+            self.tc,
+            "_send_user_message",
+            wraps=self.tc._send_user_message,
+        ) as sender:
+            self.assertEqual(chan.send(b"command"), len(b"command"))
+        self.assertEqual(sender.call_count, 1)
+        self.assertEqual(schan.recv(len(b"command")), b"command")
+
+    def test_batch_dispatch_after_half_the_pool_dies(self):
+        """
+        Simulate a connection-reuse pool where the peer kills half of the
+        connections.  Each command must either be sent on a live connection or
+        fail so the caller can reconnect and retry that single command; no
+        command may be lost or applied twice.
+        """
+        pool_size = 4
+        dead = {0, 2}
+        with ExitStack() as stack:
+            pool = []
+            for _ in range(pool_size):
+                tc, ts = stack.enter_context(server(skip_verify=True))
+                chan = tc.open_session()
+                chan.invoke_shell()
+                schan = ts.accept(1.0)
+                pool.append((tc, ts, chan, schan))
+
+            for i in dead:
+                pool[i][1].close()
+            for i in dead:
+                deadline = time.time() + 2.0
+                while pool[i][0].is_active() and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(pool[i][0].is_active())
+
+            received = []
+            for i, (tc, ts, chan, schan) in enumerate(pool):
+                command = "cmd-{}\n".format(i).encode()
+                try:
+                    if not tc.is_active():
+                        raise socket.error("stale pooled connection")
+                    chan.sendall(command)
+                    target = schan
+                except (socket.error, EOFError, SSHException):
+                    # Reconnect this connection only, and resend only the
+                    # command that failed.
+                    tc, ts = stack.enter_context(server(skip_verify=True))
+                    chan = tc.open_session()
+                    chan.invoke_shell()
+                    target = ts.accept(1.0)
+                    chan.sendall(command)
+                target.settimeout(3.0)
+                received.append(target.makefile().readline().strip())
+
+        self.assertEqual(len(received), pool_size)
+        self.assertEqual(
+            sorted(received),
+            sorted("cmd-{}".format(i) for i in range(pool_size)),
+        )
 
     @needs_builtin("buffer")
     def test_channel_send_buffer(self):

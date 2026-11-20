@@ -791,6 +791,7 @@ class Channel(ClosingContextManager):
 
         :raises socket.timeout: if no data could be sent before the timeout set
             by `settimeout`.
+        :raises socket.error: if the channel or its `.Transport` is closed.
         """
 
         m = Message()
@@ -812,6 +813,8 @@ class Channel(ClosingContextManager):
 
         :raises socket.timeout:
             if no data could be sent before the timeout set by `settimeout`.
+        :raises socket.error:
+            if the channel or its `.Transport` is closed.
 
         .. versionadded:: 1.1
         """
@@ -1190,20 +1193,28 @@ class Channel(ClosingContextManager):
         size = len(s)
         self.lock.acquire()
         try:
-            if self.closed:
+            if self.closed or self.eof_sent:
                 # this doesn't seem useful, but it is the documented behavior
                 # of Socket
                 raise socket.error("Socket is closed")
+            # Check the transport locally before allocating window: a dead
+            # transport means writes cannot reach the peer, even if this
+            # channel has not received its close notification yet.  This is
+            # just an attribute check, so normal sends stay round-trip free.
+            if self.transport is None or not self.transport.is_active():
+                raise socket.error("Socket is closed")
             size = self._wait_for_send_window(size)
             if size == 0:
-                # eof or similar
-                return 0
+                # The channel closed while we were waiting for window space.
+                raise socket.error("Socket is closed")
             m.add_string(s[:size])
         finally:
             self.lock.release()
         # Note: We release self.lock before calling _send_user_message.
         # Otherwise, we can deadlock during re-keying.
-        self.transport._send_user_message(m)
+        if self.transport._send_user_message(m) is False:
+            # The transport died between the check above and the actual write.
+            raise socket.error("Socket is closed")
         return size
 
     def _log(self, level, msg, *args):
