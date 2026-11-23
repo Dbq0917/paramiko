@@ -645,6 +645,56 @@ class SSHClientTest(ClientTest):
         self.assertEqual(target_env, getattr(schan, "env", {}))
         schan.close()
 
+    def test_exec_command_does_not_leak_channels(self):
+        """
+        Repeated commands must release their channels even if the remote end
+        keeps them open until the client says otherwise.
+        """
+        self._test_connection(password="pygmalion")
+        check_exec = self.ts.server_object.check_channel_exec_request
+
+        def mark_exec(channel, command):
+            channel.exec_seen = True
+            return check_exec(channel, command)
+
+        self.ts.server_object.check_channel_exec_request = mark_exec
+        server_channels = []
+        stop = threading.Event()
+
+        def serve():
+            while not stop.is_set():
+                schan = self.ts.accept(0.1)
+                if schan is None:
+                    continue
+                try:
+                    schan.send("ok\n")
+                    deadline = time.time() + 1.0
+                    while not getattr(schan, "exec_seen", False):
+                        if time.time() > deadline:
+                            break
+                        time.sleep(0.001)
+                    schan.shutdown_write()
+                except Exception:
+                    pass
+                server_channels.append(schan)
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        streams = []
+        try:
+            for _ in range(1000):
+                stdin, stdout, stderr = self.tc.exec_command("yes")
+                streams.append((stdin, stdout, stderr))
+                self.assertEqual(b"ok\n", stdout.read())
+        finally:
+            stop.set()
+            thread.join(2)
+            for schan in server_channels:
+                schan.close()
+
+        self.assertEqual([], list(self.tc._transport._channels.values()))
+        self.assertEqual(set(), self.tc._channels)
+
     @unittest.skip("Clients normally fail silently, thus so do we, for now")
     def test_env_update_failures(self):
         self._setup_for_env()

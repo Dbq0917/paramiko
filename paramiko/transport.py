@@ -510,6 +510,7 @@ class Transport(threading.Thread, ClosingContextManager):
 
         # tracking open channels
         self._channels = ChannelMap()
+        self._closed_channels = ChannelMap()
         self.channel_events = {}  # (id -> Event)
         self.channels_seen = {}  # (id -> True)
         self._channel_counter = 0
@@ -866,6 +867,7 @@ class Transport(threading.Thread, ClosingContextManager):
         self.stop_thread()
         for chan in list(self._channels.values()):
             chan._unlink()
+        self._closed_channels = ChannelMap()
         self.sock.close()
 
     def get_remote_server_key(self):
@@ -1019,6 +1021,7 @@ class Transport(threading.Thread, ClosingContextManager):
         if not self.active:
             raise SSHException("SSH session not active")
         timeout = self.channel_timeout if timeout is None else timeout
+        chanid = None
         self.lock.acquire()
         try:
             window_size = self._sanitize_window_size(window_size)
@@ -1046,26 +1049,30 @@ class Transport(threading.Thread, ClosingContextManager):
             chan._set_window(window_size, max_packet_size)
         finally:
             self.lock.release()
-        self._send_user_message(m)
-        start_ts = time.time()
-        while True:
-            event.wait(0.1)
-            if not self.active:
-                e = self.get_exception()
-                if e is None:
-                    e = SSHException("Unable to open channel.")
-                raise e
-            if event.is_set():
-                break
-            elif start_ts + timeout < time.time():
-                raise SSHException("Timeout opening channel.")
-        chan = self._channels.get(chanid)
-        if chan is not None:
-            return chan
-        e = self.get_exception()
-        if e is None:
-            e = SSHException("Unable to open channel.")
-        raise e
+        try:
+            self._send_user_message(m)
+            start_ts = time.time()
+            while True:
+                event.wait(0.1)
+                if not self.active:
+                    e = self.get_exception()
+                    if e is None:
+                        e = SSHException("Unable to open channel.")
+                    raise e
+                if event.is_set():
+                    break
+                elif start_ts + timeout < time.time():
+                    raise SSHException("Timeout opening channel.")
+            chan = self._channels.get(chanid)
+            if chan is not None:
+                return chan
+            e = self.get_exception()
+            if e is None:
+                e = SSHException("Unable to open channel.")
+            raise e
+        except BaseException:
+            self._discard_channel(chanid)
+            raise
 
     def request_port_forward(self, address, port, handler=None):
         """
@@ -1797,15 +1804,56 @@ class Transport(threading.Thread, ClosingContextManager):
     def _next_channel(self):
         """you are holding the lock"""
         chanid = self._channel_counter
-        while self._channels.get(chanid) is not None:
+        while (
+            self._channels.get(chanid) is not None
+            or self._closed_channels.get(chanid) is not None
+        ):
             self._channel_counter = (self._channel_counter + 1) & 0xFFFFFF
             chanid = self._channel_counter
         self._channel_counter = (self._channel_counter + 1) & 0xFFFFFF
         return chanid
 
+    def _get_channel(self, chanid):
+        """
+        Find a channel which is either active, or locally closed but still
+        waiting for any final metadata from the peer.
+        """
+        chan = self._channels.get(chanid)
+        if chan is None:
+            chan = self._closed_channels.get(chanid)
+        return chan
+
+    def _retire_channel(self, chanid):
+        """
+        Remove a locally closed channel from the active list.
+
+        The channel is moved to a weak tombstone map so late metadata
+        (exit-status and friends) can still reach it until the peer's close
+        arrives.
+        """
+        chan = self._channels.get(chanid)
+        if chan is not None:
+            self._closed_channels.put(chanid, chan)
+        self._channels.delete(chanid)
+
     def _unlink_channel(self, chanid):
         """used by a Channel to remove itself from the active channel list"""
         self._channels.delete(chanid)
+        self._closed_channels.delete(chanid)
+        self.channels_seen.pop(chanid, None)
+
+    def _discard_channel(self, chanid):
+        """
+        Forget a channel whose open request never completed.
+        """
+        if chanid is None:
+            return
+        self._channels.delete(chanid)
+        self._closed_channels.delete(chanid)
+        self.channels_seen.pop(chanid, None)
+        event = self.channel_events.pop(chanid, None)
+        if event is not None:
+            event.set()
 
     def _send_message(self, data):
         self.packetizer.send_message(data)
@@ -2094,7 +2142,7 @@ class Transport(threading.Thread, ClosingContextManager):
                             self._handler_table[ptype](m)
                     elif ptype in self._channel_handler_table:
                         chanid = m.get_int()
-                        chan = self._channels.get(chanid)
+                        chan = self._get_channel(chanid)
                         if chan is not None:
                             self._channel_handler_table[ptype](chan, m)
                         elif chanid in self.channels_seen:
@@ -2165,6 +2213,7 @@ class Transport(threading.Thread, ClosingContextManager):
             _active_threads.remove(self)
             for chan in list(self._channels.values()):
                 chan._unlink()
+            self._closed_channels = ChannelMap()
             if self.active:
                 self.active = False
                 self.packetizer.close()
@@ -2872,6 +2921,8 @@ class Transport(threading.Thread, ClosingContextManager):
             self.saved_exception = ChannelException(reason, reason_text)
             if chanid in self.channel_events:
                 self._channels.delete(chanid)
+                self._closed_channels.delete(chanid)
+                self.channels_seen.pop(chanid, None)
                 if chanid in self.channel_events:
                     self.channel_events[chanid].set()
                     del self.channel_events[chanid]

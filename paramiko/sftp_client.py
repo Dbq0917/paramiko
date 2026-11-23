@@ -166,8 +166,15 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         )
         if chan is None:
             return None
-        chan.invoke_subsystem("sftp")
-        return cls(chan)
+        try:
+            chan.invoke_subsystem("sftp")
+            return cls(chan)
+        except BaseException:
+            try:
+                chan.close()
+            except Exception:
+                pass
+            raise
 
     def _log(self, level, msg, *args):
         if isinstance(msg, list):

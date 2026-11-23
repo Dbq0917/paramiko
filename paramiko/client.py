@@ -25,6 +25,7 @@ import inspect
 import os
 import socket
 import warnings
+import weakref
 from binascii import hexlify
 from errno import ECONNREFUSED, EHOSTUNREACH
 
@@ -75,6 +76,7 @@ class SSHClient(ClosingContextManager):
         self._policy = RejectPolicy()
         self._transport = None
         self._agent = None
+        self._channels = set()
 
     def load_system_host_keys(self, filename=None):
         """
@@ -498,6 +500,12 @@ class SSHClient(ClosingContextManager):
         """
         if self._transport is None:
             return
+        while self._channels:
+            chan = self._channels.pop()
+            try:
+                chan.close()
+            except Exception:
+                pass
         self._transport.close()
         self._transport = None
 
@@ -545,16 +553,24 @@ class SSHClient(ClosingContextManager):
         .. versionchanged:: 1.10
             Added the ``get_pty`` kwarg.
         """
-        chan = self._transport.open_session(timeout=timeout)
-        if get_pty:
-            chan.get_pty()
-        chan.settimeout(timeout)
-        if environment:
-            chan.update_environment(environment)
-        chan.exec_command(command)
-        stdin = chan.makefile_stdin("wb", bufsize)
-        stdout = chan.makefile("r", bufsize)
-        stderr = chan.makefile_stderr("r", bufsize)
+        chan = self._open_channel(timeout=timeout)
+        chan._set_close_on_file_exit()
+        try:
+            if get_pty:
+                chan.get_pty()
+            chan.settimeout(timeout)
+            if environment:
+                chan.update_environment(environment)
+            chan.exec_command(command)
+            stdin = chan.makefile_stdin("wb", bufsize)
+            stdout = chan.makefile("r", bufsize)
+            stderr = chan.makefile_stderr("r", bufsize)
+        except BaseException:
+            try:
+                chan.close()
+            except Exception:
+                pass
+            raise
         return stdin, stdout, stderr
 
     def invoke_shell(
@@ -582,9 +598,16 @@ class SSHClient(ClosingContextManager):
 
         :raises: `.SSHException` -- if the server fails to invoke a shell
         """
-        chan = self._transport.open_session()
-        chan.get_pty(term, width, height, width_pixels, height_pixels)
-        chan.invoke_shell()
+        chan = self._open_channel()
+        try:
+            chan.get_pty(term, width, height, width_pixels, height_pixels)
+            chan.invoke_shell()
+        except BaseException:
+            try:
+                chan.close()
+            except Exception:
+                pass
+            raise
         return chan
 
     def open_sftp(self):
@@ -593,7 +616,32 @@ class SSHClient(ClosingContextManager):
 
         :return: a new `.SFTPClient` session object
         """
-        return self._transport.open_sftp_client()
+        sftp = self._transport.open_sftp_client()
+        if sftp is not None:
+            self._track_channel(sftp.get_channel())
+        return sftp
+
+    def _open_channel(self, **kwargs):
+        """
+        Open a channel on behalf of this client and track it centrally.
+
+        Low-level callers should use this instead of reaching into the
+        transport, so channel lifetime stays owned by the connection object.
+        """
+        chan = self._transport.open_session(**kwargs)
+        self._track_channel(chan)
+        return chan
+
+    def _track_channel(self, chan):
+        self._channels.add(chan)
+        client_ref = weakref.ref(self)
+
+        def forget(channel):
+            client = client_ref()
+            if client is not None:
+                client._channels.discard(channel)
+
+        chan._add_close_callback(forget)
 
     def get_transport(self):
         """

@@ -127,6 +127,10 @@ class Channel(ClosingContextManager):
         self._name = str(chanid)
         self.logger = util.get_logger("paramiko.transport")
         self._pipe = None
+        self._file_lock = threading.Lock()
+        self._file_refs = 0
+        self._close_files_on_last = False
+        self._close_callbacks = []
         self.event = threading.Event()
         self.event_ready = False
         self.combine_stderr = False
@@ -667,6 +671,12 @@ class Channel(ClosingContextManager):
         for m in msgs:
             if m is not None:
                 self.transport._send_user_message(m)
+        # Once we have told the peer to close, this channel is no longer
+        # active from the caller's point of view.  Keep a weak tombstone in
+        # Transport so any metadata arriving just after the close request
+        # (notably exit-status) can still be delivered.
+        if self.transport is not None:
+            self.transport._retire_channel(self.chanid)
 
     def recv_ready(self):
         """
@@ -1234,6 +1244,48 @@ class Channel(ClosingContextManager):
         self.status_event.set()
         if self._pipe is not None:
             self._pipe.set_forever()
+        with self._file_lock:
+            callbacks, self._close_callbacks = self._close_callbacks, []
+        for callback in callbacks:
+            try:
+                callback(self)
+            except Exception:
+                pass
+
+    def _add_close_callback(self, callback):
+        """
+        Register a callback invoked once when this channel is closed.
+
+        Used internally by connection owners to stop tracking the channel.
+        """
+        with self._file_lock:
+            if not self.closed:
+                self._close_callbacks.append(callback)
+                return
+        callback(self)
+
+    def _add_file(self):
+        with self._file_lock:
+            self._file_refs += 1
+
+    def _remove_file(self):
+        with self._file_lock:
+            if self._file_refs <= 0:
+                return
+            self._file_refs -= 1
+            last_file = self._file_refs == 0
+        if last_file and self._close_files_on_last:
+            self.close()
+
+    def _set_close_on_file_exit(self):
+        """
+        Close this channel once all of its file wrappers are closed.
+
+        Used by `SSHClient.exec_command`, where the channel is an
+        implementation detail of the returned streams.
+        """
+        with self._file_lock:
+            self._close_files_on_last = True
 
     def _send_eof(self):
         # you are holding the lock.
@@ -1340,14 +1392,18 @@ class ChannelFile(BufferedFile):
         To correctly emulate the file object created from a socket's `makefile
         <python:socket.socket.makefile>` method, a `.Channel` and its
         `.ChannelFile` should be able to be closed or garbage-collected
-        independently. Currently, closing the `ChannelFile` does nothing but
-        flush the buffer.
+        independently. Channels owned by `SSHClient.exec_command` close once
+        all of their file wrappers have been closed or garbage-collected.
     """
 
     def __init__(self, channel, mode="r", bufsize=-1):
         self.channel = channel
+        self._channel_released = False
         BufferedFile.__init__(self)
         self._set_mode(mode, bufsize)
+        add_file = getattr(channel, "_add_file", None)
+        if callable(add_file):
+            add_file()
 
     def __repr__(self):
         """
@@ -1356,11 +1412,28 @@ class ChannelFile(BufferedFile):
         return "<paramiko.ChannelFile from " + repr(self.channel) + ">"
 
     def _read(self, size):
-        return self.channel.recv(size)
+        data = self.channel.recv(size)
+        self._release_on_eof(data)
+        return data
 
     def _write(self, data):
         self.channel.sendall(data)
         return len(data)
+
+    def _release_on_eof(self, data):
+        if not data and getattr(self.channel, "_close_files_on_last", False):
+            self.channel.close()
+
+    def close(self):
+        if self._channel_released:
+            return
+        self._channel_released = True
+        try:
+            super().close()
+        finally:
+            remove_file = getattr(self.channel, "_remove_file", None)
+            if callable(remove_file):
+                remove_file()
 
 
 class ChannelStderrFile(ChannelFile):
@@ -1371,7 +1444,9 @@ class ChannelStderrFile(ChannelFile):
     """
 
     def _read(self, size):
-        return self.channel.recv_stderr(size)
+        data = self.channel.recv_stderr(size)
+        self._release_on_eof(data)
+        return data
 
     def _write(self, data):
         self.channel.sendall_stderr(data)
@@ -1386,5 +1461,7 @@ class ChannelStdinFile(ChannelFile):
     """
 
     def close(self):
+        if self._channel_released:
+            return
         super().close()
         self.channel.shutdown_write()
