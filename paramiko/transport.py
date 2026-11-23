@@ -79,6 +79,7 @@ from paramiko.common import (
     OPEN_SUCCEEDED,
     WARNING,
     byte_ord,
+    cMSG_CHANNEL_WINDOW_ADJUST,
     cMSG_CHANNEL_OPEN,
     cMSG_CHANNEL_OPEN_FAILURE,
     cMSG_CHANNEL_OPEN_SUCCESS,
@@ -149,6 +150,113 @@ def _join_lingering_threads():
 import atexit
 
 atexit.register(_join_lingering_threads)
+
+
+class _ChannelWindowAllocator:
+    """
+    Share one receive-window budget across all channels on a transport.
+
+    A channel which is opened first must not be able to claim the entire
+    connection budget before its peers appear.  New channels therefore start
+    with an equal share of a small number of slots.  As data is consumed, free
+    credit is handed back out to bring channels up to the current fair share.
+    """
+
+    # Five slots cover the common "one streaming channel plus several control
+    # channels" workload without making the initial grants too small.
+    _initial_slots = 5
+    _growth_delay = 0.25
+
+    def __init__(self, budget):
+        self._budget = budget
+        self._initial_share = max(
+            MIN_WINDOW_SIZE, budget // self._initial_slots
+        )
+        self._free = budget
+        self._states = {}
+        self._cursor = 0
+        self._last_add = 0.0
+        self._lock = threading.RLock()
+
+    def add_channel(self, chan, max_window):
+        with self._lock:
+            if chan.chanid in self._states:
+                return self._states[chan.chanid]["granted"]
+            granted = min(self._free, self._initial_share, max_window)
+            self._free -= granted
+            self._states[chan.chanid] = {
+                "channel": chan,
+                "granted": granted,
+                "max_window": max_window,
+            }
+            self._last_add = time.monotonic()
+            return granted
+
+    def remove_channel(self, chanid):
+        with self._lock:
+            state = self._states.pop(chanid, None)
+            if state is not None:
+                self._free += state["granted"]
+
+    def release(self, chanid, nbytes):
+        """
+        Return consumed bytes to the shared budget and grant any newly
+        available credit fairly.  Returns a list of ``(channel, bytes)``
+        pairs to announce with ``CHANNEL_WINDOW_ADJUST``.
+        """
+        if nbytes <= 0:
+            return []
+        with self._lock:
+            state = self._states.get(chanid)
+            if state is None:
+                return []
+            consumed = min(nbytes, state["granted"])
+            state["granted"] -= consumed
+            self._free += consumed
+            return self._rebalance()
+
+    def clear(self):
+        with self._lock:
+            self._states.clear()
+            self._free = self._budget
+
+    def _rebalance(self):
+        channels = [
+            state
+            for state in self._states.values()
+            if state["channel"].active
+            and not state["channel"].closed
+            and not state["channel"].eof_received
+        ]
+        if not channels or self._free <= 0:
+            return []
+        if (
+            len(channels) == 1
+            and time.monotonic() - self._last_add < self._growth_delay
+        ):
+            target = min(self._budget, self._initial_share)
+        else:
+            target = max(MIN_WINDOW_SIZE, self._budget // len(channels))
+        grants = []
+        while self._free > 0:
+            progressed = False
+            start = self._cursor % len(channels)
+            for offset in range(len(channels)):
+                state = channels[(start + offset) % len(channels)]
+                need = min(target, state["max_window"]) - state["granted"]
+                if need <= 0:
+                    continue
+                granted = min(need, self._free)
+                state["granted"] += granted
+                self._free -= granted
+                grants.append((state["channel"], granted))
+                progressed = True
+                if self._free <= 0:
+                    break
+            if not progressed:
+                break
+        self._cursor = (self._cursor + 1) % len(channels)
+        return grants
 
 
 class Transport(threading.Thread, ClosingContextManager):
@@ -392,8 +500,8 @@ class Transport(threading.Thread, ClosingContextManager):
         :param socket sock:
             a socket or socket-like object to create the session over.
         :param int default_window_size:
-            sets the default window size on the transport. (defaults to
-            2097152)
+            sets the connection-level receive window budget used by channels
+            on this transport. (defaults to 2097152)
         :param int default_max_packet_size:
             sets the default max packet size on the transport. (defaults to
             32768)
@@ -515,6 +623,11 @@ class Transport(threading.Thread, ClosingContextManager):
         self._channel_counter = 0
         self.default_max_packet_size = default_max_packet_size
         self.default_window_size = default_window_size
+        self._window_allocator = _ChannelWindowAllocator(
+            clamp_value(
+                MIN_WINDOW_SIZE, default_window_size, MAX_WINDOW_SIZE
+            )
+        )
         self._forward_agent_handler = None
         self._x11_handler = None
         self._tcp_handler = None
@@ -908,7 +1021,9 @@ class Transport(threading.Thread, ClosingContextManager):
             as in the OpenSSH code base and have been battle tested.
 
         :param int window_size:
-            optional window size for this session.
+            optional maximum window size for this session.  The actual
+            advertised window is allocated from the transport's shared
+            connection-level budget.
         :param int max_packet_size:
             optional max packet size for this session.
 
@@ -1001,7 +1116,9 @@ class Transport(threading.Thread, ClosingContextManager):
         :param src_addr: the source address of this port forwarding, if
             ``kind`` is ``"forwarded-tcpip"``, ``"direct-tcpip"``, or ``"x11"``
         :param int window_size:
-            optional window size for this session.
+            optional maximum window size for this session.  The actual
+            advertised window is allocated from the transport's shared
+            connection-level budget.
         :param int max_packet_size:
             optional max packet size for this session.
         :param float timeout:
@@ -1024,11 +1141,17 @@ class Transport(threading.Thread, ClosingContextManager):
             window_size = self._sanitize_window_size(window_size)
             max_packet_size = self._sanitize_packet_size(max_packet_size)
             chanid = self._next_channel()
+            chan = Channel(chanid)
+            advertised_window = self._window_allocator.add_channel(
+                chan, window_size
+            )
+            chan._set_transport(self)
+            chan._set_window(advertised_window, max_packet_size)
             m = Message()
             m.add_byte(cMSG_CHANNEL_OPEN)
             m.add_string(kind)
             m.add_int(chanid)
-            m.add_int(window_size)
+            m.add_int(advertised_window)
             m.add_int(max_packet_size)
             if (kind == "forwarded-tcpip") or (kind == "direct-tcpip"):
                 m.add_string(dest_addr[0])
@@ -1038,12 +1161,9 @@ class Transport(threading.Thread, ClosingContextManager):
             elif kind == "x11":
                 m.add_string(src_addr[0])
                 m.add_int(src_addr[1])
-            chan = Channel(chanid)
             self._channels.put(chanid, chan)
             self.channel_events[chanid] = event = threading.Event()
             self.channels_seen[chanid] = True
-            chan._set_transport(self)
-            chan._set_window(window_size, max_packet_size)
         finally:
             self.lock.release()
         self._send_user_message(m)
@@ -1806,9 +1926,30 @@ class Transport(threading.Thread, ClosingContextManager):
     def _unlink_channel(self, chanid):
         """used by a Channel to remove itself from the active channel list"""
         self._channels.delete(chanid)
+        self._window_allocator.remove_channel(chanid)
 
     def _send_message(self, data):
         self.packetizer.send_message(data)
+
+    def _send_channel_window_grants(self, grants):
+        for chan, nbytes in grants:
+            if (
+                chan.active
+                and not chan.closed
+                and not chan.eof_received
+                and nbytes > 0
+            ):
+                m = Message()
+                m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
+                m.add_int(chan.remote_chanid)
+                m.add_int(nbytes)
+                self._send_user_message(m)
+
+    def _release_channel_window(self, chanid, nbytes):
+        return self._window_allocator.release(chanid, nbytes)
+
+    def _eof_channel_window(self, chanid):
+        self._window_allocator.remove_channel(chanid)
 
     def _send_user_message(self, data):
         """
@@ -2872,6 +3013,7 @@ class Transport(threading.Thread, ClosingContextManager):
             self.saved_exception = ChannelException(reason, reason_text)
             if chanid in self.channel_events:
                 self._channels.delete(chanid)
+                self._window_allocator.remove_channel(chanid)
                 if chanid in self.channel_events:
                     self.channel_events[chanid].set()
                     del self.channel_events[chanid]
@@ -2975,8 +3117,11 @@ class Transport(threading.Thread, ClosingContextManager):
             self._channels.put(my_chanid, chan)
             self.channels_seen[my_chanid] = True
             chan._set_transport(self)
+            advertised_window = self._window_allocator.add_channel(
+                chan, self._sanitize_window_size(None)
+            )
             chan._set_window(
-                self.default_window_size, self.default_max_packet_size
+                advertised_window, self.default_max_packet_size
             )
             chan._set_remote_channel(
                 chanid, initial_window_size, max_packet_size
@@ -2987,7 +3132,7 @@ class Transport(threading.Thread, ClosingContextManager):
         m.add_byte(cMSG_CHANNEL_OPEN_SUCCESS)
         m.add_int(chanid)
         m.add_int(my_chanid)
-        m.add_int(self.default_window_size)
+        m.add_int(advertised_window)
         m.add_int(self.default_max_packet_size)
         self._send_message(m)
         self._log(

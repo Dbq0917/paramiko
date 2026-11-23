@@ -31,7 +31,6 @@ from functools import wraps
 from paramiko import util
 from paramiko.common import (
     cMSG_CHANNEL_REQUEST,
-    cMSG_CHANNEL_WINDOW_ADJUST,
     cMSG_CHANNEL_DATA,
     cMSG_CHANNEL_EXTENDED_DATA,
     DEBUG,
@@ -80,11 +79,12 @@ class Channel(ClosingContextManager):
 
     Because SSH2 has a windowing kind of flow control, if you stop reading data
     from a Channel and its buffer fills up, the server will be unable to send
-    you any more data until you read some of it.  (This won't affect other
-    channels on the same transport -- all channels on a single transport are
-    flow-controlled independently.)  Similarly, if the server isn't reading
-    data you send, calls to `send` may block, unless you set a timeout.  This
-    is exactly like a normal network socket, so it shouldn't be too surprising.
+    you any more data until you read some of it.  Channels on the same
+    transport share a connection-level receive budget, so one busy channel
+    cannot consume all of the credit needed by its peers.  Similarly, if the
+    server isn't reading data you send, calls to `send` may block, unless you
+    set a timeout.  This is exactly like a normal network socket, so it
+    shouldn't be too surprising.
 
     Instances of this class may be used as context managers.
     """
@@ -698,14 +698,9 @@ class Channel(ClosingContextManager):
         except PipeTimeout:
             raise socket.timeout()
 
-        ack = self._check_add_window(len(out))
-        # no need to hold the channel lock when sending this
-        if ack > 0:
-            m = Message()
-            m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
-            m.add_int(self.remote_chanid)
-            m.add_int(ack)
-            self.transport._send_user_message(m)
+        self.transport._send_channel_window_grants(
+            self._check_add_window(len(out))
+        )
 
         return out
 
@@ -746,14 +741,9 @@ class Channel(ClosingContextManager):
         except PipeTimeout:
             raise socket.timeout()
 
-        ack = self._check_add_window(len(out))
-        # no need to hold the channel lock when sending this
-        if ack > 0:
-            m = Message()
-            m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
-            m.add_int(self.remote_chanid)
-            m.add_int(ack)
-            self.transport._send_user_message(m)
+        self.transport._send_channel_window_grants(
+            self._check_add_window(len(out))
+        )
 
         return out
 
@@ -1167,6 +1157,7 @@ class Channel(ClosingContextManager):
                 self.eof_received = True
                 self.in_buffer.close()
                 self.in_stderr_buffer.close()
+                self.transport._eof_channel_window(self.chanid)
                 if self._pipe is not None:
                     self._pipe.set_forever()
         finally:
@@ -1275,21 +1266,10 @@ class Channel(ClosingContextManager):
         self.lock.acquire()
         try:
             if self.closed or self.eof_received or not self.active:
-                return 0
-            if self.ultra_debug:
-                self._log(DEBUG, "addwindow {}".format(n))
-            self.in_window_sofar += n
-            if self.in_window_sofar <= self.in_window_threshold:
-                return 0
-            if self.ultra_debug:
-                self._log(
-                    DEBUG, "addwindow send {}".format(self.in_window_sofar)
-                )
-            out = self.in_window_sofar
-            self.in_window_sofar = 0
-            return out
+                return []
         finally:
             self.lock.release()
+        return self.transport._release_channel_window(self.chanid, n)
 
     def _wait_for_send_window(self, size):
         """

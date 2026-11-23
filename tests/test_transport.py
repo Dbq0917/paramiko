@@ -73,6 +73,7 @@ from ._util import (
     needs_builtin,
     server,
     slow,
+    wait_until,
 )
 
 LONG_BANNER = """\
@@ -833,6 +834,50 @@ class TransportTest(unittest.TestCase):
             (2**32, MAX_WINDOW_SIZE),
         ]:
             self.assertEqual(self.tc._sanitize_window_size(val), correct)
+
+    def test_connection_window_is_shared_between_channels(self):
+        """
+        verify that one channel cannot monopolize the connection window.
+        """
+        self.setup_test_server()
+        channels = []
+        try:
+            for _ in range(5):
+                chan = self.tc.open_session()
+                channels.append((chan, self.ts.accept(1.0)))
+
+            share = DEFAULT_WINDOW_SIZE // 5
+            self.assertGreaterEqual(share, MIN_WINDOW_SIZE)
+            for chan, schan in channels:
+                self.assertEqual(chan.in_window_size, share)
+                self.assertEqual(schan.out_window_size, share)
+
+            # The first channel can use its own share, but not the shares
+            # reserved for the four channels alongside it.
+            big, sbig = channels[0]
+            sent = 0
+            while sent < share:
+                sent += sbig.send(b"x" * min(4096, share - sent))
+            self.assertEqual(sbig.out_window_size, 0)
+            for _, small in channels[1:]:
+                self.assertEqual(small.send(b"ok"), 2)
+                self.assertEqual(small.out_window_size, share - 2)
+
+            # Reading the data returns its credit to the shared budget, but
+            # the first channel still cannot grow past its fair share.
+            received = 0
+            while received < share:
+                received += len(big.recv(min(65536, share - received)))
+            wait_until(
+                lambda: self.assertEqual(sbig.out_window_size, share),
+                timeout=2,
+            )
+            for _, small in channels[1:]:
+                self.assertEqual(small.out_window_size, share - 2)
+        finally:
+            for chan, schan in channels:
+                chan.close()
+                schan.close()
 
     @slow
     def test_handshake_timeout(self):
