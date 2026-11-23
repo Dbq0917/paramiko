@@ -46,6 +46,17 @@ from paramiko.sftp import (
 from paramiko.sftp_attr import SFTPAttributes
 
 
+# Leave enough space in the channel's receive window for the SFTP and SSH
+# framing of one read response.  This keeps a full batch of prefetched
+# responses inside the window the peer was given, instead of forcing it to
+# block until the application has consumed the batch.
+PREFETCH_PACKET_OVERHEAD = 1024
+
+# OpenSSH's sftp client uses a similar bound.  It is also a sane upper limit
+# when the channel window is unusually large.
+DEFAULT_MAX_CONCURRENT_PREFETCH_REQUESTS = 64
+
+
 class SFTPFile(BufferedFile):
     """
     Proxy object for a file on the remote server, in client mode SFTP.
@@ -65,10 +76,16 @@ class SFTPFile(BufferedFile):
         BufferedFile._set_mode(self, mode, bufsize)
         self.pipelined = False
         self._prefetching = False
+        self._prefetch_all_enqueued = False
         self._prefetch_done = False
         self._prefetch_data = {}
         self._prefetch_extents = {}
+        self._prefetch_pending = {}
         self._prefetch_lock = threading.Lock()
+        self._prefetch_buffer_size = 0
+        self._prefetch_buffer_limit = 0
+        self._prefetch_limit = 0
+        self._prefetch_reader_waiting = False
         self._saved_exception = None
         self._reqs = deque()
 
@@ -110,9 +127,9 @@ class SFTPFile(BufferedFile):
             pass
 
     def _data_in_prefetch_requests(self, offset, size):
-        k = [
-            x for x in list(self._prefetch_extents.values()) if x[0] <= offset
-        ]
+        with self._prefetch_lock:
+            extents = list(self._prefetch_extents.values())
+        k = [x for x in extents if x[0] <= offset]
         if len(k) == 0:
             return False
         k.sort(key=lambda x: x[0])
@@ -136,12 +153,18 @@ class SFTPFile(BufferedFile):
         return None.  this guarantees nothing about the number of bytes
         collected in the prefetch buffer so far.
         """
-        k = [i for i in self._prefetch_data.keys() if i <= offset]
+        with self._prefetch_lock:
+            keys = list(self._prefetch_data.keys())
+        k = [i for i in keys if i <= offset]
         if len(k) == 0:
             return None
         index = max(k)
+        with self._prefetch_lock:
+            data = self._prefetch_data.get(index)
+        if data is None:
+            return None
         buf_offset = offset - index
-        if buf_offset >= len(self._prefetch_data[index]):
+        if buf_offset >= len(data):
             # it's not here
             return None
         return index
@@ -159,21 +182,28 @@ class SFTPFile(BufferedFile):
                 break
             if self._prefetch_done or self._closed:
                 break
-            self.sftp._read_response()
+            with self._prefetch_lock:
+                self._prefetch_reader_waiting = True
+            try:
+                self.sftp._read_response()
+            finally:
+                with self._prefetch_lock:
+                    self._prefetch_reader_waiting = False
             self._check_exception()
         if offset is None:
             self._prefetching = False
             return None
-        prefetch = self._prefetch_data[offset]
-        del self._prefetch_data[offset]
+        with self._prefetch_lock:
+            prefetch = self._prefetch_data.pop(offset)
 
-        buf_offset = self._realpos - offset
-        if buf_offset > 0:
-            self._prefetch_data[offset] = prefetch[:buf_offset]
-            prefetch = prefetch[buf_offset:]
-        if size < len(prefetch):
-            self._prefetch_data[self._realpos + size] = prefetch[size:]
-            prefetch = prefetch[:size]
+            buf_offset = self._realpos - offset
+            if buf_offset > 0:
+                self._prefetch_data[offset] = prefetch[:buf_offset]
+                prefetch = prefetch[buf_offset:]
+            if size < len(prefetch):
+                self._prefetch_data[self._realpos + size] = prefetch[size:]
+                prefetch = prefetch[:size]
+            self._prefetch_buffer_size -= len(prefetch)
         return prefetch
 
     def _read(self, size):
@@ -455,9 +485,11 @@ class SFTPFile(BufferedFile):
             workaround, one may call `stat` explicitly and pass its value in
             via this parameter.
         :param int max_concurrent_requests:
-            The maximum number of concurrent read requests to prefetch. See
-            `.SFTPClient.get` (its ``max_concurrent_prefetch_requests`` param)
-            for details.
+            The maximum number of concurrent read requests to prefetch.
+            When this is ``None`` (the default), choose a limit from the
+            channel's receive window (between 4 and 64).  This keeps a batch of
+            responses inside the flow-control window, so the peer can finish
+            answering it before it has to wait for a window update.
 
         .. versionadded:: 1.5.1
         .. versionchanged:: 1.16.0
@@ -492,9 +524,9 @@ class SFTPFile(BufferedFile):
             a list of ``(offset, length)`` tuples indicating which sections of
             the file to read
         :param int max_concurrent_prefetch_requests:
-            The maximum number of concurrent read requests to prefetch. See
-            `.SFTPClient.get` (its ``max_concurrent_prefetch_requests`` param)
-            for details.
+            The maximum number of concurrent read requests to prefetch.
+            When this is ``None`` (the default), choose a limit from the
+            channel's receive window (between 4 and 64).
         :return: a list of blocks read, in the same order as in ``chunks``
 
         .. versionadded:: 1.5.4
@@ -535,34 +567,92 @@ class SFTPFile(BufferedFile):
             return 0
 
     def _start_prefetch(self, chunks, max_concurrent_requests=None):
+        limit = self._resolve_prefetch_limit(max_concurrent_requests)
         self._prefetching = True
+        self._prefetch_all_enqueued = False
         self._prefetch_done = False
+        with self._prefetch_lock:
+            self._prefetch_limit = limit
+            self._prefetch_buffer_limit = self._resolve_prefetch_buffer_limit()
+            self._prefetch_buffer_size = sum(
+                len(data) for data in self._prefetch_data.values()
+            )
 
         t = threading.Thread(
             target=self._prefetch_thread,
-            args=(chunks, max_concurrent_requests),
+            args=(chunks, limit),
         )
         t.daemon = True
         t.start()
 
+    def _resolve_prefetch_limit(self, max_concurrent_requests):
+        if max_concurrent_requests is not None:
+            if (
+                isinstance(max_concurrent_requests, bool)
+                or not isinstance(max_concurrent_requests, int)
+                or max_concurrent_requests <= 0
+            ):
+                raise ValueError(
+                    "max_concurrent_requests must be a positive integer"
+                )
+            return max_concurrent_requests
+        sock = getattr(self.sftp, "sock", None)
+        window = getattr(sock, "in_window_size", 0) or 0
+        if window <= 0:
+            return DEFAULT_MAX_CONCURRENT_PREFETCH_REQUESTS
+        per_request = self.MAX_REQUEST_SIZE + PREFETCH_PACKET_OVERHEAD
+        return max(
+            4,
+            min(
+                DEFAULT_MAX_CONCURRENT_PREFETCH_REQUESTS,
+                window // per_request,
+            ),
+        )
+
+    def _resolve_prefetch_buffer_limit(self):
+        sock = getattr(self.sftp, "sock", None)
+        window = getattr(sock, "in_window_size", 0) or 0
+        # Bound unread prefetched data as well as in-flight requests.
+        return max(2 * window, 2 * self.MAX_REQUEST_SIZE)
+
     def _prefetch_thread(self, chunks, max_concurrent_requests):
         # do these read requests in a temporary thread because there may be
         # a lot of them, so it may block.
-        for offset, length in chunks:
-            # Limit the number of concurrent requests in a busy-loop
-            if max_concurrent_requests is not None:
-                while True:
+        try:
+            for offset, length in chunks:
+                if self._closed:
+                    return
+                # Limit both requests in flight and unread prefetched data.
+                while not self._closed:
                     with self._prefetch_lock:
-                        pf_len = len(self._prefetch_extents)
-                        if pf_len < max_concurrent_requests:
+                        if (
+                            len(self._prefetch_extents)
+                            < max_concurrent_requests
+                            and (
+                                self._prefetch_buffer_size
+                                < self._prefetch_buffer_limit
+                                or self._prefetch_reader_waiting
+                            )
+                        ):
                             break
                     time.sleep(io_sleep)
+                if self._closed:
+                    return
 
-            num = self.sftp._async_request(
-                self, CMD_READ, self.handle, int64(offset), int(length)
-            )
+                num = self.sftp._async_request(
+                    self, CMD_READ, self.handle, int64(offset), int(length)
+                )
+                with self._prefetch_lock:
+                    self._prefetch_extents[num] = (offset, length)
+                    pending = self._prefetch_pending.pop(num, None)
+                    if pending is not None:
+                        self._record_prefetch_pending(num, pending)
+        finally:
             with self._prefetch_lock:
-                self._prefetch_extents[num] = (offset, length)
+                self._prefetch_all_enqueued = True
+                self._prefetch_pending.clear()
+                if not self._prefetch_extents:
+                    self._prefetch_done = True
 
     def _async_response(self, t, msg, num):
         if t == CMD_STATUS:
@@ -571,20 +661,50 @@ class SFTPFile(BufferedFile):
                 self.sftp._convert_status(msg)
             except Exception as e:
                 self._saved_exception = e
+            with self._prefetch_lock:
+                if num in self._prefetch_extents:
+                    self._prefetch_extents.pop(num, None)
+                    self._finish_prefetch_request()
+                else:
+                    # As with data responses, the status can arrive before
+                    # the request is recorded.  Keep it for that thread.
+                    self._prefetch_pending[num] = ("status", None)
             return
         if t != CMD_DATA:
             raise SFTPError("Expected data")
         data = msg.get_string()
-        while True:
-            with self._prefetch_lock:
-                # spin if in race with _prefetch_thread
-                if num in self._prefetch_extents:
-                    offset, length = self._prefetch_extents[num]
-                    self._prefetch_data[offset] = data
-                    del self._prefetch_extents[num]
-                    if len(self._prefetch_extents) == 0:
-                        self._prefetch_done = True
-                    break
+        with self._prefetch_lock:
+            if num in self._prefetch_extents:
+                self._record_prefetch_data(num, data)
+            else:
+                # A fast peer can answer before _prefetch_thread has recorded
+                # the request.  Queue the response instead of spinning while
+                # that thread may itself be blocked on channel window space.
+                self._prefetch_pending[num] = ("data", data)
+
+    def _record_prefetch_pending(self, num, pending):
+        # Caller must hold _prefetch_lock.
+        kind, value = pending
+        if kind == "data":
+            self._record_prefetch_data(num, value)
+            return
+        self._prefetch_extents.pop(num, None)
+        self._finish_prefetch_request()
+
+    def _record_prefetch_data(self, num, data):
+        # Caller must hold _prefetch_lock.
+        extent = self._prefetch_extents.pop(num, None)
+        if extent is None:
+            return
+        offset, length = extent
+        self._prefetch_data[offset] = data
+        self._prefetch_buffer_size += len(data)
+        self._finish_prefetch_request()
+
+    def _finish_prefetch_request(self):
+        # Caller must hold _prefetch_lock.
+        if self._prefetch_all_enqueued and not self._prefetch_extents:
+            self._prefetch_done = True
 
     def _check_exception(self):
         """if there's a saved exception, raise & clear it"""

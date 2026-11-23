@@ -2,6 +2,13 @@
 Changelog
 =========
 
+- :bug:`-` SFTP prefetching now applies flow control to both its in-flight
+  read requests and its unread buffer. The default limit is derived from the
+  channel's receive window (between 4 and 64 requests), so a large download
+  cannot fill the window with more requests than the peer can answer before it
+  needs a window update. Prefetched data is also bounded, and a response that
+  arrives before the prefetch thread has recorded its request is queued
+  instead of making the reader spin while the sender waits for window space.
 - :release:`5.1.0 <2026-10-17>`
 - :release:`5.0.1 <2026-10-17>`
 - :bug:`2462` (w/ earlier fix attempts :issue:`2475` and :issue:`2465`) An API

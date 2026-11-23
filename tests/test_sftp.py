@@ -26,15 +26,23 @@ do test file operations in (so no existing files will be harmed).
 import os
 import socket
 import sys
+import time
 import warnings
 from binascii import hexlify
 from io import StringIO
 from tempfile import mkstemp
+from types import SimpleNamespace
 
 import pytest
 
 from paramiko.common import o777, o600, o666, o644
+from paramiko.message import Message
+from paramiko.sftp import CMD_DATA, CMD_READ
 from paramiko.sftp_attr import SFTPAttributes
+from paramiko.sftp_file import (
+    DEFAULT_MAX_CONCURRENT_PREFETCH_REQUESTS,
+    SFTPFile,
+)
 from paramiko.util import b, u
 from tests import requireNonAsciiLocale
 
@@ -830,3 +838,87 @@ class TestSFTP:
                 assert f.read() == data
         finally:
             sftp.remove(f"{sftp.FOLDER}/write_memoryview")
+
+
+class FakePrefetchSftp:
+    def __init__(self, window_size, data=b""):
+        self.sock = SimpleNamespace(in_window_size=window_size)
+        self.data = data
+        self.requests = []
+        self.next_request = 1
+
+    def _log(self, *args, **kwargs):
+        pass
+
+    def _request(self, *args, **kwargs):
+        raise EOFError()
+
+    def _async_request(self, fileobj, kind, *args):
+        if kind != CMD_READ:
+            return self.next_request
+        offset, length = args[1:]
+        num = self.next_request
+        self.next_request += 1
+        self.requests.append((num, offset, length))
+        msg = Message()
+        msg.add_string(self.data)
+        msg.rewind()
+        # Simulate a response overtaking the prefetch thread's bookkeeping.
+        fileobj._async_response(CMD_DATA, msg, num)
+        return num
+
+
+class TestPrefetchFlowControl:
+    def test_default_limit_tracks_channel_window(self):
+        sftp = FakePrefetchSftp(2 * 1024 * 1024)
+        remote = SFTPFile(sftp, b"handle", "rb")
+        assert remote._resolve_prefetch_limit(None) == 62
+
+        sftp.sock.in_window_size = 64 * 1024
+        assert remote._resolve_prefetch_limit(None) == 4
+
+        sftp.sock.in_window_size = 0
+        assert (
+            remote._resolve_prefetch_limit(None)
+            == DEFAULT_MAX_CONCURRENT_PREFETCH_REQUESTS
+        )
+
+    def test_explicit_prefetch_limit(self):
+        remote = SFTPFile(FakePrefetchSftp(2 * 1024 * 1024), b"handle", "rb")
+        assert remote._resolve_prefetch_limit(7) == 7
+        with pytest.raises(ValueError):
+            remote._resolve_prefetch_limit(0)
+        with pytest.raises(ValueError):
+            remote._resolve_prefetch_limit(True)
+
+    def test_response_before_request_bookkeeping_does_not_deadlock(self):
+        sftp = FakePrefetchSftp(2 * 1024 * 1024, data=b"abcd")
+        remote = SFTPFile(sftp, b"handle", "rb")
+        remote.prefetch(4)
+
+        deadline = time.time() + 2
+        while not remote._prefetch_done and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert remote._prefetch_done
+        assert remote._prefetch_pending == {}
+        assert remote.read(4) == b"abcd"
+
+    def test_unread_prefetch_data_is_bounded(self):
+        sftp = FakePrefetchSftp(2 * 1024 * 1024, data=b"x" * 32768)
+        remote = SFTPFile(sftp, b"handle", "rb")
+        remote.prefetch(200 * 1024 * 1024)
+        try:
+            deadline = time.time() + 2
+            while (
+                remote._prefetch_buffer_size < remote._prefetch_buffer_limit
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            assert (
+                remote._prefetch_buffer_size
+                <= remote._prefetch_buffer_limit
+            )
+            assert remote._prefetch_buffer_size < 200 * 1024 * 1024
+        finally:
+            remote._closed = True

@@ -138,6 +138,22 @@ class TestBigSFTP:
         finally:
             sftp.remove(f"{sftp.FOLDER}/hongry.txt")
 
+    def test_large_file_prefetch_flow_control(self, sftp, tmp_path):
+        """
+        A daily archive sized file must transfer without filling the channel
+        window and waiting forever for a window update.
+        """
+        size = 200 * 1024 * 1024
+        target = f"{sftp.FOLDER}/daily-archive.log"
+        local = tmp_path / "daily-archive.log"
+        try:
+            with open(target, "wb") as f:
+                f.truncate(size)
+            sftp.get(target, str(local))
+            assert local.stat().st_size == size
+        finally:
+            sftp.remove(target)
+
     def test_prefetch_seek(self, sftp):
         kblob = bytes().join([struct.pack(">H", n) for n in range(512)])
         try:
